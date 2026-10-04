@@ -1,0 +1,77 @@
+name: Finalize video (QC + thumbnail, no re-render)
+
+# Started by n8n ("Dispatch and Wait for Completion"). Free: GitHub-hosted runner, FFmpeg + ImageMagick only.
+# Reuses the artifact of an earlier render run, checks it, builds thumbnail.jpg and publishes the files as a
+# pre-release so n8n can download them without a token. Calls n8n back with the QC summary.
+on:
+  workflow_dispatch:
+    inputs:
+      render_run_id:
+        description: Run id of the render workflow whose artifact to finalize
+        required: true
+        type: string
+      job_path:
+        description: Path of the render job JSON in this repo
+        required: true
+        type: string
+      resumeUrl:
+        description: n8n resume URL (set automatically by n8n)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TAG: video-${{ inputs.render_run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg, ImageMagick and fonts
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends ffmpeg imagemagick fonts-dejavu-core
+
+      - name: Download render artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: video-${{ inputs.render_run_id }}
+          run-id: ${{ inputs.render_run_id }}
+          github-token: ${{ github.token }}
+          path: art
+
+      - name: QC + thumbnail
+        run: python3 render/finalize.py --art art --job "${{ inputs.job_path }}" --out final
+
+      - name: Publish files as pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "$TAG" -y --cleanup-tag || true
+          gh release create "$TAG" final/video.mp4 final/thumbnail.jpg final/contact_sheet.jpg final/qc_report.json final/subtitles.srt final/subtitles_sentences.srt \
+            --prerelease --title "Render $TAG (temporary)" --notes "Temporary upload staging for n8n. Safe to delete after the YouTube upload."
+
+      - name: Notify n8n
+        if: always() && inputs.resumeUrl != ''
+        env:
+          RESUME_URL: ${{ inputs.resumeUrl }}
+          STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BASE: ${{ github.server_url }}/${{ github.repository }}/releases/download/video-${{ inputs.render_run_id }}
+          REL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/video-${{ inputs.render_run_id }}
+        run: |
+          python3 -c "
+          import json, os
+          s = json.load(open('final/summary.json')) if os.path.exists('final/summary.json') else {}
+          b = os.environ['BASE']
+          print(json.dumps({'status': os.environ['STATUS'], 'run_url': os.environ['RUN_URL'], 'tag': os.environ['TAG'],
+            'release_url': os.environ['REL'], 'video_url': b + '/video.mp4', 'thumbnail_url': b + '/thumbnail.jpg',
+            'contact_sheet_url': b + '/contact_sheet.jpg', 'qc_report_url': b + '/qc_report.json',
+            'subtitles_url': b + '/subtitles_sentences.srt', 'summary': s}))
+          " > notify.json
+          curl -sS -X POST -H 'Content-Type: application/json' --data @notify.json "$RESUME_URL"

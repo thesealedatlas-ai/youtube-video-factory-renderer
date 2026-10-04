@@ -1,0 +1,72 @@
+name: Render video (Piper + FFmpeg)
+
+# Started by n8n ("Dispatch and Wait for Completion"). Free: runs on GitHub-hosted runners.
+# n8n passes:
+#   job_path  - path in this repo of the render payload JSON that n8n committed
+#   resumeUrl - n8n callback URL; called when the render finishes (success or failure)
+on:
+  workflow_dispatch:
+    inputs:
+      job_path:
+        description: Path to render payload JSON in this repo
+        required: true
+        type: string
+      resumeUrl:
+        description: n8n resume URL (set automatically by n8n)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg, fonts and Cairo
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core libcairo2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Piper and CairoSVG
+        run: pip install piper-tts cairosvg
+
+      - name: Cache Piper voice
+        uses: actions/cache@v4
+        with:
+          path: voices
+          key: piper-voice-en_US-ryan-high-v1
+
+      - name: Render
+        id: render
+        run: python render/render.py --payload "${{ inputs.job_path }}" --out out --voices voices
+
+      - name: Upload video artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ github.run_id }}
+          path: |
+            out/video.mp4
+            out/narration.wav
+            out/subtitles.srt
+            out/render_report.json
+          retention-days: 14
+
+      - name: Notify n8n
+        if: always() && inputs.resumeUrl != ''
+        env:
+          RESUME_URL: ${{ inputs.resumeUrl }}
+          STATUS: ${{ job.status }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 -c "import json,os; r=json.load(open('out/render_report.json')) if os.path.exists('out/render_report.json') else {}; r.pop('beats', None); r.pop('credits', None); print(json.dumps({'status': os.environ['STATUS'], 'run_url': os.environ['RUN_URL'], 'run_id': os.environ['RUN_ID'], 'artifact_name': 'video-' + os.environ['RUN_ID'], 'report': r}))" > notify.json
+          curl -sS -X POST -H 'Content-Type: application/json' --data @notify.json "$RESUME_URL"
